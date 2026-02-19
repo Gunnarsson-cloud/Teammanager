@@ -1,13 +1,13 @@
 """
-database.py - Databashantering för Teammanager
+database.py - Databashantering för Teammanager v3.0
 Hanterar all CRUD-logik mot SQLite-databasen.
+Inkluderar: personal, projekt, allokering, kompetenser, frånvaro, kommentarer.
 """
 
 import sqlite3
 import os
-from datetime import datetime
+from datetime import datetime, date, timedelta
 
-# Sökväg till databasen (samma mapp som scriptet)
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "teammanager.db")
 
 
@@ -61,6 +61,26 @@ def init_db():
             FOREIGN KEY (personal_id) REFERENCES personal(id) ON DELETE CASCADE,
             UNIQUE(personal_id, tagg)
         );
+
+        CREATE TABLE IF NOT EXISTS franvaro (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            personal_id INTEGER NOT NULL,
+            datum TEXT NOT NULL,
+            typ TEXT NOT NULL DEFAULT 'semester',
+            notering TEXT DEFAULT '',
+            FOREIGN KEY (personal_id) REFERENCES personal(id) ON DELETE CASCADE,
+            UNIQUE(personal_id, datum)
+        );
+
+        CREATE TABLE IF NOT EXISTS kommentarer (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            personal_id INTEGER NOT NULL,
+            datum TEXT NOT NULL,
+            text TEXT NOT NULL DEFAULT '',
+            skapad TEXT DEFAULT (datetime('now')),
+            FOREIGN KEY (personal_id) REFERENCES personal(id) ON DELETE CASCADE,
+            UNIQUE(personal_id, datum)
+        );
     """)
 
     conn.commit()
@@ -72,7 +92,6 @@ def init_db():
 # ============================================================
 
 def hamta_all_personal(bara_aktiva=True):
-    """Hämta alla medarbetare. Returnerar lista av dict."""
     conn = get_connection()
     if bara_aktiva:
         rows = conn.execute("SELECT * FROM personal WHERE aktiv = 1 ORDER BY namn").fetchall()
@@ -83,7 +102,6 @@ def hamta_all_personal(bara_aktiva=True):
 
 
 def lagg_till_personal(namn, roll="", kapacitet_h=8.0):
-    """Lägg till en ny medarbetare. Returnerar id eller None vid fel."""
     conn = get_connection()
     try:
         cursor = conn.execute(
@@ -99,7 +117,6 @@ def lagg_till_personal(namn, roll="", kapacitet_h=8.0):
 
 
 def uppdatera_personal(person_id, namn, roll, kapacitet_h, aktiv):
-    """Uppdatera en medarbetare."""
     conn = get_connection()
     try:
         conn.execute(
@@ -115,7 +132,6 @@ def uppdatera_personal(person_id, namn, roll, kapacitet_h, aktiv):
 
 
 def ta_bort_personal(person_id):
-    """Ta bort en medarbetare och alla dess allokeringar."""
     conn = get_connection()
     conn.execute("DELETE FROM personal WHERE id=?", (person_id,))
     conn.commit()
@@ -127,7 +143,6 @@ def ta_bort_personal(person_id):
 # ============================================================
 
 def hamta_alla_projekt(bara_aktiva=True):
-    """Hämta alla projekt."""
     conn = get_connection()
     if bara_aktiva:
         rows = conn.execute("SELECT * FROM projekt WHERE aktiv = 1 ORDER BY namn").fetchall()
@@ -138,7 +153,6 @@ def hamta_alla_projekt(bara_aktiva=True):
 
 
 def lagg_till_projekt(namn, farg="#3498db", startdatum=None, slutdatum=None):
-    """Lägg till ett nytt projekt."""
     conn = get_connection()
     try:
         cursor = conn.execute(
@@ -154,7 +168,6 @@ def lagg_till_projekt(namn, farg="#3498db", startdatum=None, slutdatum=None):
 
 
 def uppdatera_projekt(projekt_id, namn, farg, startdatum, slutdatum, aktiv):
-    """Uppdatera ett projekt."""
     conn = get_connection()
     try:
         conn.execute(
@@ -170,7 +183,6 @@ def uppdatera_projekt(projekt_id, namn, farg, startdatum, slutdatum, aktiv):
 
 
 def ta_bort_projekt(projekt_id):
-    """Ta bort ett projekt och alla dess allokeringar."""
     conn = get_connection()
     conn.execute("DELETE FROM projekt WHERE id=?", (projekt_id,))
     conn.commit()
@@ -182,10 +194,6 @@ def ta_bort_projekt(projekt_id):
 # ============================================================
 
 def hamta_allokeringar(personal_id=None, projekt_id=None, fran_datum=None, till_datum=None):
-    """
-    Hämta allokeringar med valfria filter.
-    Returnerar lista av dict med joinade namn.
-    """
     conn = get_connection()
     query = """
         SELECT a.id, a.personal_id, a.projekt_id, a.datum, a.timmar,
@@ -197,7 +205,6 @@ def hamta_allokeringar(personal_id=None, projekt_id=None, fran_datum=None, till_
         WHERE 1=1
     """
     params = []
-
     if personal_id:
         query += " AND a.personal_id = ?"
         params.append(personal_id)
@@ -210,7 +217,6 @@ def hamta_allokeringar(personal_id=None, projekt_id=None, fran_datum=None, till_
     if till_datum:
         query += " AND a.datum <= ?"
         params.append(str(till_datum))
-
     query += " ORDER BY a.datum, p.namn"
     rows = conn.execute(query, params).fetchall()
     conn.close()
@@ -218,12 +224,9 @@ def hamta_allokeringar(personal_id=None, projekt_id=None, fran_datum=None, till_
 
 
 def satt_allokering(personal_id, projekt_id, datum, timmar):
-    """
-    Sätt allokering (upsert). Om timmar=0 tas allokeringen bort.
-    """
+    """Upsert allokering. Om timmar <= 0 raderas posten."""
     conn = get_connection()
     datum_str = str(datum)
-
     if timmar <= 0:
         conn.execute(
             "DELETE FROM allokering WHERE personal_id=? AND projekt_id=? AND datum=?",
@@ -236,13 +239,57 @@ def satt_allokering(personal_id, projekt_id, datum, timmar):
             ON CONFLICT(personal_id, projekt_id, datum)
             DO UPDATE SET timmar = excluded.timmar
         """, (personal_id, projekt_id, datum_str, timmar))
-
     conn.commit()
     conn.close()
 
 
+def bulk_allokera(personal_id, projekt_id, datum_lista, timmar_per_dag):
+    """Allokera en person till ett projekt för en lista av datum."""
+    conn = get_connection()
+    for d in datum_lista:
+        datum_str = str(d)
+        if timmar_per_dag <= 0:
+            conn.execute(
+                "DELETE FROM allokering WHERE personal_id=? AND projekt_id=? AND datum=?",
+                (personal_id, projekt_id, datum_str)
+            )
+        else:
+            conn.execute("""
+                INSERT INTO allokering (personal_id, projekt_id, datum, timmar)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(personal_id, projekt_id, datum)
+                DO UPDATE SET timmar = excluded.timmar
+            """, (personal_id, projekt_id, datum_str, timmar_per_dag))
+    conn.commit()
+    conn.close()
+
+
+def kopiera_vecka(personal_id, fran_vecka_start, till_vecka_start):
+    """Kopiera alla allokeringar från en vecka till en annan för en person."""
+    conn = get_connection()
+    fran_slut = fran_vecka_start + timedelta(days=4)  # Mån-Fre
+    rows = conn.execute("""
+        SELECT projekt_id, datum, timmar FROM allokering
+        WHERE personal_id=? AND datum >= ? AND datum <= ?
+    """, (personal_id, str(fran_vecka_start), str(fran_slut))).fetchall()
+
+    dag_diff = (till_vecka_start - fran_vecka_start).days
+    for row in rows:
+        gammalt_datum = datetime.strptime(row["datum"], "%Y-%m-%d").date()
+        nytt_datum = gammalt_datum + timedelta(days=dag_diff)
+        conn.execute("""
+            INSERT INTO allokering (personal_id, projekt_id, datum, timmar)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(personal_id, projekt_id, datum)
+            DO UPDATE SET timmar = excluded.timmar
+        """, (personal_id, row["projekt_id"], str(nytt_datum), row["timmar"]))
+
+    conn.commit()
+    conn.close()
+    return len(rows)
+
+
 def hamta_dagsbelastning(personal_id, datum):
-    """Hämta total belastning för en person på ett datum."""
     conn = get_connection()
     row = conn.execute(
         "SELECT COALESCE(SUM(timmar), 0) as total FROM allokering WHERE personal_id=? AND datum=?",
@@ -257,7 +304,6 @@ def hamta_dagsbelastning(personal_id, datum):
 # ============================================================
 
 def hamta_kompetenser(personal_id):
-    """Hämta alla kompetenstaggar för en person."""
     conn = get_connection()
     rows = conn.execute(
         "SELECT tagg FROM kompetenser WHERE personal_id=? ORDER BY tagg",
@@ -268,17 +314,13 @@ def hamta_kompetenser(personal_id):
 
 
 def hamta_alla_kompetenser():
-    """Hämta alla unika kompetenstaggar i systemet."""
     conn = get_connection()
-    rows = conn.execute(
-        "SELECT DISTINCT tagg FROM kompetenser ORDER BY tagg"
-    ).fetchall()
+    rows = conn.execute("SELECT DISTINCT tagg FROM kompetenser ORDER BY tagg").fetchall()
     conn.close()
     return [r["tagg"] for r in rows]
 
 
 def satt_kompetenser(personal_id, taggar):
-    """Sätt kompetenser för en person (ersätter befintliga)."""
     conn = get_connection()
     conn.execute("DELETE FROM kompetenser WHERE personal_id=?", (personal_id,))
     for tagg in taggar:
@@ -293,3 +335,264 @@ def satt_kompetenser(personal_id, taggar):
                 pass
     conn.commit()
     conn.close()
+
+
+# ============================================================
+# FRÅNVARO (semester, sjuk, VAB, tjänstledigt, övrigt)
+# ============================================================
+
+FRANVARO_TYPER = {
+    "semester": {"namn": "Semester", "ikon": "🌴", "farg": "#00b894"},
+    "sjuk": {"namn": "Sjuk", "ikon": "🤒", "farg": "#e17055"},
+    "vab": {"namn": "VAB", "ikon": "👶", "farg": "#fdcb6e"},
+    "tjanstledig": {"namn": "Tjänstledig", "ikon": "📋", "farg": "#74b9ff"},
+    "utbildning": {"namn": "Utbildning", "ikon": "📚", "farg": "#a29bfe"},
+    "ovrigt": {"namn": "Övrigt", "ikon": "📌", "farg": "#636e72"},
+}
+
+
+def hamta_franvaro(personal_id=None, fran_datum=None, till_datum=None):
+    """Hämta frånvaro med valfria filter."""
+    conn = get_connection()
+    query = """
+        SELECT f.id, f.personal_id, f.datum, f.typ, f.notering,
+               p.namn as personal_namn
+        FROM franvaro f
+        JOIN personal p ON f.personal_id = p.id
+        WHERE 1=1
+    """
+    params = []
+    if personal_id:
+        query += " AND f.personal_id = ?"
+        params.append(personal_id)
+    if fran_datum:
+        query += " AND f.datum >= ?"
+        params.append(str(fran_datum))
+    if till_datum:
+        query += " AND f.datum <= ?"
+        params.append(str(till_datum))
+    query += " ORDER BY f.datum, p.namn"
+    rows = conn.execute(query, params).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def satt_franvaro(personal_id, datum, typ, notering=""):
+    """Registrera frånvaro (upsert). Typ='' tar bort frånvaron."""
+    conn = get_connection()
+    datum_str = str(datum)
+    if not typ:
+        conn.execute(
+            "DELETE FROM franvaro WHERE personal_id=? AND datum=?",
+            (personal_id, datum_str)
+        )
+    else:
+        conn.execute("""
+            INSERT INTO franvaro (personal_id, datum, typ, notering)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(personal_id, datum)
+            DO UPDATE SET typ = excluded.typ, notering = excluded.notering
+        """, (personal_id, datum_str, typ, notering))
+    conn.commit()
+    conn.close()
+
+
+def bulk_franvaro(personal_id, datum_lista, typ, notering=""):
+    """Registrera frånvaro för flera datum."""
+    conn = get_connection()
+    for d in datum_lista:
+        conn.execute("""
+            INSERT INTO franvaro (personal_id, datum, typ, notering)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(personal_id, datum)
+            DO UPDATE SET typ = excluded.typ, notering = excluded.notering
+        """, (personal_id, str(d), typ, notering))
+    conn.commit()
+    conn.close()
+
+
+def ta_bort_franvaro(personal_id, fran_datum, till_datum):
+    """Ta bort all frånvaro för en person i ett intervall."""
+    conn = get_connection()
+    conn.execute(
+        "DELETE FROM franvaro WHERE personal_id=? AND datum >= ? AND datum <= ?",
+        (personal_id, str(fran_datum), str(till_datum))
+    )
+    conn.commit()
+    conn.close()
+
+
+def ar_franvarande(personal_id, datum):
+    """Kolla om en person är frånvarande ett specifikt datum."""
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT typ FROM franvaro WHERE personal_id=? AND datum=?",
+        (personal_id, str(datum))
+    ).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+# ============================================================
+# KOMMENTARER
+# ============================================================
+
+def hamta_kommentar(personal_id, datum):
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT text FROM kommentarer WHERE personal_id=? AND datum=?",
+        (personal_id, str(datum))
+    ).fetchone()
+    conn.close()
+    return row["text"] if row else ""
+
+
+def satt_kommentar(personal_id, datum, text):
+    """Sätt kommentar (upsert). Tom text raderar."""
+    conn = get_connection()
+    if not text.strip():
+        conn.execute(
+            "DELETE FROM kommentarer WHERE personal_id=? AND datum=?",
+            (personal_id, str(datum))
+        )
+    else:
+        conn.execute("""
+            INSERT INTO kommentarer (personal_id, datum, text)
+            VALUES (?, ?, ?)
+            ON CONFLICT(personal_id, datum)
+            DO UPDATE SET text = excluded.text, skapad = datetime('now')
+        """, (personal_id, str(datum), text.strip()))
+    conn.commit()
+    conn.close()
+
+
+def hamta_kommentarer_period(personal_id, fran_datum, till_datum):
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT datum, text FROM kommentarer WHERE personal_id=? AND datum >= ? AND datum <= ? ORDER BY datum",
+        (personal_id, str(fran_datum), str(till_datum))
+    ).fetchall()
+    conn.close()
+    return {r["datum"]: r["text"] for r in rows}
+
+
+# ============================================================
+# SAMMANSTÄLLNINGAR (för startsida och lediga resurser)
+# ============================================================
+
+def hamta_overbelagda(fran_datum, till_datum):
+    """Hitta alla person+datum som är överbelagda."""
+    conn = get_connection()
+    rows = conn.execute("""
+        SELECT a.personal_id, p.namn as personal_namn, a.datum,
+               SUM(a.timmar) as total_timmar, p.kapacitet_h
+        FROM allokering a
+        JOIN personal p ON a.personal_id = p.id
+        WHERE a.datum >= ? AND a.datum <= ? AND p.aktiv = 1
+        GROUP BY a.personal_id, a.datum
+        HAVING total_timmar > p.kapacitet_h
+        ORDER BY a.datum, p.namn
+    """, (str(fran_datum), str(till_datum))).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def hamta_oallokerade(fran_datum, till_datum, arbetsdagar):
+    """Hitta alla aktiva personer som saknar allokering på arbetsdagar."""
+    personal = hamta_all_personal()
+    conn = get_connection()
+    resultat = []
+    for dag in arbetsdagar:
+        dag_str = str(dag)
+        for p in personal:
+            # Kolla om personen har frånvaro
+            franvaro = conn.execute(
+                "SELECT typ FROM franvaro WHERE personal_id=? AND datum=?",
+                (p["id"], dag_str)
+            ).fetchone()
+            if franvaro:
+                continue  # Frånvarande, hoppa över
+
+            allok = conn.execute(
+                "SELECT COALESCE(SUM(timmar), 0) as total FROM allokering WHERE personal_id=? AND datum=?",
+                (p["id"], dag_str)
+            ).fetchone()
+            if allok["total"] == 0:
+                resultat.append({
+                    "personal_id": p["id"],
+                    "personal_namn": p["namn"],
+                    "datum": dag_str,
+                    "roll": p["roll"]
+                })
+    conn.close()
+    return resultat
+
+
+def hamta_lediga_resurser(datum):
+    """Hitta personer som har ledig kapacitet på ett datum."""
+    personal = hamta_all_personal()
+    conn = get_connection()
+    lediga = []
+    for p in personal:
+        # Kolla frånvaro
+        franvaro = conn.execute(
+            "SELECT typ FROM franvaro WHERE personal_id=? AND datum=?",
+            (p["id"], str(datum))
+        ).fetchone()
+        if franvaro:
+            continue
+
+        allok = conn.execute(
+            "SELECT COALESCE(SUM(timmar), 0) as total FROM allokering WHERE personal_id=? AND datum=?",
+            (p["id"], str(datum))
+        ).fetchone()
+        ledig_tid = p["kapacitet_h"] - allok["total"]
+        if ledig_tid > 0:
+            lediga.append({
+                "personal_id": p["id"],
+                "namn": p["namn"],
+                "roll": p["roll"],
+                "kapacitet_h": p["kapacitet_h"],
+                "allokerat": allok["total"],
+                "ledigt": ledig_tid
+            })
+    conn.close()
+    return sorted(lediga, key=lambda x: x["ledigt"], reverse=True)
+
+
+def hamta_teamoversikt(fran_datum, till_datum, arbetsdagar):
+    """
+    Hämta komplett teamöversikt: per person, per dag - vad de gör.
+    Returnerar dict: {personal_id: {datum_str: [{'projekt': namn, 'farg': hex, 'timmar': float}]}}
+    """
+    personal = hamta_all_personal()
+    allokeringar = hamta_allokeringar(fran_datum=fran_datum, till_datum=till_datum)
+    franvaro_data = hamta_franvaro(fran_datum=fran_datum, till_datum=till_datum)
+
+    oversikt = {}
+    for p in personal:
+        oversikt[p["id"]] = {"namn": p["namn"], "roll": p["roll"],
+                              "kapacitet_h": p["kapacitet_h"], "dagar": {}}
+        for dag in arbetsdagar:
+            dag_str = str(dag)
+            oversikt[p["id"]]["dagar"][dag_str] = {"allokeringar": [], "franvaro": None}
+
+    # Fyll i allokeringar
+    for a in allokeringar:
+        pid = a["personal_id"]
+        dag_str = a["datum"]
+        if pid in oversikt and dag_str in oversikt[pid]["dagar"]:
+            oversikt[pid]["dagar"][dag_str]["allokeringar"].append({
+                "projekt": a["projekt_namn"],
+                "farg": a["projekt_farg"],
+                "timmar": a["timmar"]
+            })
+
+    # Fyll i frånvaro
+    for f in franvaro_data:
+        pid = f["personal_id"]
+        dag_str = f["datum"]
+        if pid in oversikt and dag_str in oversikt[pid]["dagar"]:
+            oversikt[pid]["dagar"][dag_str]["franvaro"] = f["typ"]
+
+    return oversikt
