@@ -1,6 +1,7 @@
 """
-database.py - Databashantering för Teammanager v3.0
-Hanterar all CRUD-logik mot SQLite-databasen.
+database.py - Databashantering för Teammanager v3.1
+Hanterar all CRUD-logik mot databasen.
+Stödjer både SQLite (lokal utveckling) och PostgreSQL/Supabase (produktion).
 Inkluderar: personal, projekt, allokering, kompetenser, frånvaro, kommentarer.
 """
 
@@ -10,80 +11,228 @@ from datetime import datetime, date, timedelta
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "teammanager.db")
 
+# ============================================================
+# DUAL-MODE: PostgreSQL (Supabase) eller SQLite (lokal fallback)
+# ============================================================
+
+_USE_POSTGRES = False
+_SUPABASE_DB_URL = ""
+
+try:
+    import streamlit as st
+    _SUPABASE_DB_URL = st.secrets.get("database", {}).get("SUPABASE_DB_URL", "")
+except Exception:
+    _SUPABASE_DB_URL = os.environ.get("SUPABASE_DB_URL", "")
+
+if _SUPABASE_DB_URL:
+    try:
+        import psycopg2
+        import psycopg2.extras
+        _USE_POSTGRES = True
+    except ImportError:
+        _USE_POSTGRES = False
+
+# Databasspecifika inställningar
+if _USE_POSTGRES:
+    _IntegrityError = psycopg2.IntegrityError
+    _NOW_FUNC = "CURRENT_TIMESTAMP"
+else:
+    _IntegrityError = sqlite3.IntegrityError
+    _NOW_FUNC = "datetime('now')"
+
+
+def _q(query):
+    """Konvertera SQLite ?-placeholders till PostgreSQL %s om det behövs."""
+    if _USE_POSTGRES:
+        return query.replace("?", "%s")
+    return query
+
+
+# ============================================================
+# CONNECTION WRAPPER FÖR POSTGRESQL
+# ============================================================
+
+class _PgConnectionWrapper:
+    """Wrappar psycopg2-connection att bete sig som sqlite3.Connection.
+    Alla execute()-anrop använder DictCursor automatiskt så att
+    row["kolumn"] och dict(row) fungerar likadant som sqlite3.Row.
+    """
+
+    def __init__(self, conn):
+        self._conn = conn
+
+    def execute(self, query, params=None):
+        cursor = self._conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+        cursor.execute(query, params or ())
+        return cursor
+
+    def executescript(self, script):
+        """Ej tillgänglig för PostgreSQL — använd execute() per statement."""
+        raise NotImplementedError("Använd execute() per statement för PostgreSQL")
+
+    def commit(self):
+        self._conn.commit()
+
+    def rollback(self):
+        self._conn.rollback()
+
+    def close(self):
+        self._conn.close()
+
+    def cursor(self):
+        return self._conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+
+
+# ============================================================
+# ANSLUTNING
+# ============================================================
 
 def get_connection():
-    """Skapa och returnera en databasanslutning med foreign keys aktiverade."""
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("PRAGMA foreign_keys = ON")
-    conn.row_factory = sqlite3.Row
-    return conn
+    """Skapa och returnera en databasanslutning.
+    PostgreSQL om SUPABASE_DB_URL finns, annars SQLite.
+    """
+    if _USE_POSTGRES:
+        raw = psycopg2.connect(_SUPABASE_DB_URL)
+        raw.autocommit = False
+        return _PgConnectionWrapper(raw)
+    else:
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.row_factory = sqlite3.Row
+        return conn
+
+
+# ============================================================
+# TABELLINITIERING
+# ============================================================
+
+_CREATE_TABLES_PG = [
+    """CREATE TABLE IF NOT EXISTS personal (
+        id SERIAL PRIMARY KEY,
+        namn TEXT NOT NULL UNIQUE,
+        roll TEXT DEFAULT '',
+        kapacitet_h REAL DEFAULT 8.0,
+        aktiv INTEGER DEFAULT 1,
+        skapad_datum TEXT DEFAULT CURRENT_DATE
+    )""",
+    """CREATE TABLE IF NOT EXISTS projekt (
+        id SERIAL PRIMARY KEY,
+        namn TEXT NOT NULL UNIQUE,
+        farg TEXT DEFAULT '#3498db',
+        startdatum TEXT,
+        slutdatum TEXT,
+        aktiv INTEGER DEFAULT 1
+    )""",
+    """CREATE TABLE IF NOT EXISTS allokering (
+        id SERIAL PRIMARY KEY,
+        personal_id INTEGER NOT NULL,
+        projekt_id INTEGER NOT NULL,
+        datum TEXT NOT NULL,
+        timmar REAL NOT NULL DEFAULT 0,
+        FOREIGN KEY (personal_id) REFERENCES personal(id) ON DELETE CASCADE,
+        FOREIGN KEY (projekt_id) REFERENCES projekt(id) ON DELETE CASCADE,
+        UNIQUE(personal_id, projekt_id, datum)
+    )""",
+    """CREATE TABLE IF NOT EXISTS kompetenser (
+        id SERIAL PRIMARY KEY,
+        personal_id INTEGER NOT NULL,
+        tagg TEXT NOT NULL,
+        FOREIGN KEY (personal_id) REFERENCES personal(id) ON DELETE CASCADE,
+        UNIQUE(personal_id, tagg)
+    )""",
+    """CREATE TABLE IF NOT EXISTS franvaro (
+        id SERIAL PRIMARY KEY,
+        personal_id INTEGER NOT NULL,
+        datum TEXT NOT NULL,
+        typ TEXT NOT NULL DEFAULT 'semester',
+        notering TEXT DEFAULT '',
+        FOREIGN KEY (personal_id) REFERENCES personal(id) ON DELETE CASCADE,
+        UNIQUE(personal_id, datum)
+    )""",
+    """CREATE TABLE IF NOT EXISTS kommentarer (
+        id SERIAL PRIMARY KEY,
+        personal_id INTEGER NOT NULL,
+        datum TEXT NOT NULL,
+        text TEXT NOT NULL DEFAULT '',
+        skapad TEXT DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (personal_id) REFERENCES personal(id) ON DELETE CASCADE,
+        UNIQUE(personal_id, datum)
+    )""",
+]
+
+_CREATE_TABLES_SQLITE = """
+    CREATE TABLE IF NOT EXISTS personal (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        namn TEXT NOT NULL UNIQUE,
+        roll TEXT DEFAULT '',
+        kapacitet_h REAL DEFAULT 8.0,
+        aktiv INTEGER DEFAULT 1,
+        skapad_datum TEXT DEFAULT (date('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS projekt (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        namn TEXT NOT NULL UNIQUE,
+        farg TEXT DEFAULT '#3498db',
+        startdatum TEXT,
+        slutdatum TEXT,
+        aktiv INTEGER DEFAULT 1
+    );
+
+    CREATE TABLE IF NOT EXISTS allokering (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        personal_id INTEGER NOT NULL,
+        projekt_id INTEGER NOT NULL,
+        datum TEXT NOT NULL,
+        timmar REAL NOT NULL DEFAULT 0,
+        FOREIGN KEY (personal_id) REFERENCES personal(id) ON DELETE CASCADE,
+        FOREIGN KEY (projekt_id) REFERENCES projekt(id) ON DELETE CASCADE,
+        UNIQUE(personal_id, projekt_id, datum)
+    );
+
+    CREATE TABLE IF NOT EXISTS kompetenser (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        personal_id INTEGER NOT NULL,
+        tagg TEXT NOT NULL,
+        FOREIGN KEY (personal_id) REFERENCES personal(id) ON DELETE CASCADE,
+        UNIQUE(personal_id, tagg)
+    );
+
+    CREATE TABLE IF NOT EXISTS franvaro (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        personal_id INTEGER NOT NULL,
+        datum TEXT NOT NULL,
+        typ TEXT NOT NULL DEFAULT 'semester',
+        notering TEXT DEFAULT '',
+        FOREIGN KEY (personal_id) REFERENCES personal(id) ON DELETE CASCADE,
+        UNIQUE(personal_id, datum)
+    );
+
+    CREATE TABLE IF NOT EXISTS kommentarer (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        personal_id INTEGER NOT NULL,
+        datum TEXT NOT NULL,
+        text TEXT NOT NULL DEFAULT '',
+        skapad TEXT DEFAULT (datetime('now')),
+        FOREIGN KEY (personal_id) REFERENCES personal(id) ON DELETE CASCADE,
+        UNIQUE(personal_id, datum)
+    );
+"""
 
 
 def init_db():
     """Skapa alla tabeller om de inte redan finns."""
     conn = get_connection()
-    cursor = conn.cursor()
-
-    cursor.executescript("""
-        CREATE TABLE IF NOT EXISTS personal (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            namn TEXT NOT NULL UNIQUE,
-            roll TEXT DEFAULT '',
-            kapacitet_h REAL DEFAULT 8.0,
-            aktiv INTEGER DEFAULT 1,
-            skapad_datum TEXT DEFAULT (date('now'))
-        );
-
-        CREATE TABLE IF NOT EXISTS projekt (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            namn TEXT NOT NULL UNIQUE,
-            farg TEXT DEFAULT '#3498db',
-            startdatum TEXT,
-            slutdatum TEXT,
-            aktiv INTEGER DEFAULT 1
-        );
-
-        CREATE TABLE IF NOT EXISTS allokering (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            personal_id INTEGER NOT NULL,
-            projekt_id INTEGER NOT NULL,
-            datum TEXT NOT NULL,
-            timmar REAL NOT NULL DEFAULT 0,
-            FOREIGN KEY (personal_id) REFERENCES personal(id) ON DELETE CASCADE,
-            FOREIGN KEY (projekt_id) REFERENCES projekt(id) ON DELETE CASCADE,
-            UNIQUE(personal_id, projekt_id, datum)
-        );
-
-        CREATE TABLE IF NOT EXISTS kompetenser (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            personal_id INTEGER NOT NULL,
-            tagg TEXT NOT NULL,
-            FOREIGN KEY (personal_id) REFERENCES personal(id) ON DELETE CASCADE,
-            UNIQUE(personal_id, tagg)
-        );
-
-        CREATE TABLE IF NOT EXISTS franvaro (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            personal_id INTEGER NOT NULL,
-            datum TEXT NOT NULL,
-            typ TEXT NOT NULL DEFAULT 'semester',
-            notering TEXT DEFAULT '',
-            FOREIGN KEY (personal_id) REFERENCES personal(id) ON DELETE CASCADE,
-            UNIQUE(personal_id, datum)
-        );
-
-        CREATE TABLE IF NOT EXISTS kommentarer (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            personal_id INTEGER NOT NULL,
-            datum TEXT NOT NULL,
-            text TEXT NOT NULL DEFAULT '',
-            skapad TEXT DEFAULT (datetime('now')),
-            FOREIGN KEY (personal_id) REFERENCES personal(id) ON DELETE CASCADE,
-            UNIQUE(personal_id, datum)
-        );
-    """)
-
-    conn.commit()
+    if _USE_POSTGRES:
+        cursor = conn.cursor()
+        for stmt in _CREATE_TABLES_PG:
+            cursor.execute(stmt)
+        conn.commit()
+        cursor.close()
+    else:
+        cursor = conn.cursor()
+        cursor.executescript(_CREATE_TABLES_SQLITE)
+        conn.commit()
     conn.close()
 
 
@@ -104,13 +253,23 @@ def hamta_all_personal(bara_aktiva=True):
 def lagg_till_personal(namn, roll="", kapacitet_h=8.0):
     conn = get_connection()
     try:
-        cursor = conn.execute(
-            "INSERT INTO personal (namn, roll, kapacitet_h) VALUES (?, ?, ?)",
-            (namn.strip(), roll.strip(), kapacitet_h)
-        )
-        conn.commit()
-        return cursor.lastrowid
-    except sqlite3.IntegrityError:
+        if _USE_POSTGRES:
+            cursor = conn.execute(
+                _q("INSERT INTO personal (namn, roll, kapacitet_h) VALUES (?, ?, ?) RETURNING id"),
+                (namn.strip(), roll.strip(), kapacitet_h)
+            )
+            conn.commit()
+            return cursor.fetchone()["id"]
+        else:
+            cursor = conn.execute(
+                "INSERT INTO personal (namn, roll, kapacitet_h) VALUES (?, ?, ?)",
+                (namn.strip(), roll.strip(), kapacitet_h)
+            )
+            conn.commit()
+            return cursor.lastrowid
+    except _IntegrityError:
+        if _USE_POSTGRES:
+            conn.rollback()
         return None
     finally:
         conn.close()
@@ -120,12 +279,14 @@ def uppdatera_personal(person_id, namn, roll, kapacitet_h, aktiv):
     conn = get_connection()
     try:
         conn.execute(
-            "UPDATE personal SET namn=?, roll=?, kapacitet_h=?, aktiv=? WHERE id=?",
+            _q("UPDATE personal SET namn=?, roll=?, kapacitet_h=?, aktiv=? WHERE id=?"),
             (namn.strip(), roll.strip(), kapacitet_h, aktiv, person_id)
         )
         conn.commit()
         return True
-    except sqlite3.IntegrityError:
+    except _IntegrityError:
+        if _USE_POSTGRES:
+            conn.rollback()
         return False
     finally:
         conn.close()
@@ -133,7 +294,7 @@ def uppdatera_personal(person_id, namn, roll, kapacitet_h, aktiv):
 
 def ta_bort_personal(person_id):
     conn = get_connection()
-    conn.execute("DELETE FROM personal WHERE id=?", (person_id,))
+    conn.execute(_q("DELETE FROM personal WHERE id=?"), (person_id,))
     conn.commit()
     conn.close()
 
@@ -155,13 +316,23 @@ def hamta_alla_projekt(bara_aktiva=True):
 def lagg_till_projekt(namn, farg="#3498db", startdatum=None, slutdatum=None):
     conn = get_connection()
     try:
-        cursor = conn.execute(
-            "INSERT INTO projekt (namn, farg, startdatum, slutdatum) VALUES (?, ?, ?, ?)",
-            (namn.strip(), farg, startdatum, slutdatum)
-        )
-        conn.commit()
-        return cursor.lastrowid
-    except sqlite3.IntegrityError:
+        if _USE_POSTGRES:
+            cursor = conn.execute(
+                _q("INSERT INTO projekt (namn, farg, startdatum, slutdatum) VALUES (?, ?, ?, ?) RETURNING id"),
+                (namn.strip(), farg, startdatum, slutdatum)
+            )
+            conn.commit()
+            return cursor.fetchone()["id"]
+        else:
+            cursor = conn.execute(
+                "INSERT INTO projekt (namn, farg, startdatum, slutdatum) VALUES (?, ?, ?, ?)",
+                (namn.strip(), farg, startdatum, slutdatum)
+            )
+            conn.commit()
+            return cursor.lastrowid
+    except _IntegrityError:
+        if _USE_POSTGRES:
+            conn.rollback()
         return None
     finally:
         conn.close()
@@ -171,12 +342,14 @@ def uppdatera_projekt(projekt_id, namn, farg, startdatum, slutdatum, aktiv):
     conn = get_connection()
     try:
         conn.execute(
-            "UPDATE projekt SET namn=?, farg=?, startdatum=?, slutdatum=?, aktiv=? WHERE id=?",
+            _q("UPDATE projekt SET namn=?, farg=?, startdatum=?, slutdatum=?, aktiv=? WHERE id=?"),
             (namn.strip(), farg, startdatum, slutdatum, aktiv, projekt_id)
         )
         conn.commit()
         return True
-    except sqlite3.IntegrityError:
+    except _IntegrityError:
+        if _USE_POSTGRES:
+            conn.rollback()
         return False
     finally:
         conn.close()
@@ -184,7 +357,7 @@ def uppdatera_projekt(projekt_id, namn, farg, startdatum, slutdatum, aktiv):
 
 def ta_bort_projekt(projekt_id):
     conn = get_connection()
-    conn.execute("DELETE FROM projekt WHERE id=?", (projekt_id,))
+    conn.execute(_q("DELETE FROM projekt WHERE id=?"), (projekt_id,))
     conn.commit()
     conn.close()
 
@@ -218,7 +391,7 @@ def hamta_allokeringar(personal_id=None, projekt_id=None, fran_datum=None, till_
         query += " AND a.datum <= ?"
         params.append(str(till_datum))
     query += " ORDER BY a.datum, p.namn"
-    rows = conn.execute(query, params).fetchall()
+    rows = conn.execute(_q(query), params).fetchall()
     conn.close()
     return [dict(r) for r in rows]
 
@@ -229,16 +402,16 @@ def satt_allokering(personal_id, projekt_id, datum, timmar):
     datum_str = str(datum)
     if timmar <= 0:
         conn.execute(
-            "DELETE FROM allokering WHERE personal_id=? AND projekt_id=? AND datum=?",
+            _q("DELETE FROM allokering WHERE personal_id=? AND projekt_id=? AND datum=?"),
             (personal_id, projekt_id, datum_str)
         )
     else:
-        conn.execute("""
+        conn.execute(_q("""
             INSERT INTO allokering (personal_id, projekt_id, datum, timmar)
             VALUES (?, ?, ?, ?)
             ON CONFLICT(personal_id, projekt_id, datum)
             DO UPDATE SET timmar = excluded.timmar
-        """, (personal_id, projekt_id, datum_str, timmar))
+        """), (personal_id, projekt_id, datum_str, timmar))
     conn.commit()
     conn.close()
 
@@ -250,16 +423,16 @@ def bulk_allokera(personal_id, projekt_id, datum_lista, timmar_per_dag):
         datum_str = str(d)
         if timmar_per_dag <= 0:
             conn.execute(
-                "DELETE FROM allokering WHERE personal_id=? AND projekt_id=? AND datum=?",
+                _q("DELETE FROM allokering WHERE personal_id=? AND projekt_id=? AND datum=?"),
                 (personal_id, projekt_id, datum_str)
             )
         else:
-            conn.execute("""
+            conn.execute(_q("""
                 INSERT INTO allokering (personal_id, projekt_id, datum, timmar)
                 VALUES (?, ?, ?, ?)
                 ON CONFLICT(personal_id, projekt_id, datum)
                 DO UPDATE SET timmar = excluded.timmar
-            """, (personal_id, projekt_id, datum_str, timmar_per_dag))
+            """), (personal_id, projekt_id, datum_str, timmar_per_dag))
     conn.commit()
     conn.close()
 
@@ -268,21 +441,21 @@ def kopiera_vecka(personal_id, fran_vecka_start, till_vecka_start):
     """Kopiera alla allokeringar från en vecka till en annan för en person."""
     conn = get_connection()
     fran_slut = fran_vecka_start + timedelta(days=4)  # Mån-Fre
-    rows = conn.execute("""
+    rows = conn.execute(_q("""
         SELECT projekt_id, datum, timmar FROM allokering
         WHERE personal_id=? AND datum >= ? AND datum <= ?
-    """, (personal_id, str(fran_vecka_start), str(fran_slut))).fetchall()
+    """), (personal_id, str(fran_vecka_start), str(fran_slut))).fetchall()
 
     dag_diff = (till_vecka_start - fran_vecka_start).days
     for row in rows:
         gammalt_datum = datetime.strptime(row["datum"], "%Y-%m-%d").date()
         nytt_datum = gammalt_datum + timedelta(days=dag_diff)
-        conn.execute("""
+        conn.execute(_q("""
             INSERT INTO allokering (personal_id, projekt_id, datum, timmar)
             VALUES (?, ?, ?, ?)
             ON CONFLICT(personal_id, projekt_id, datum)
             DO UPDATE SET timmar = excluded.timmar
-        """, (personal_id, row["projekt_id"], str(nytt_datum), row["timmar"]))
+        """), (personal_id, row["projekt_id"], str(nytt_datum), row["timmar"]))
 
     conn.commit()
     conn.close()
@@ -292,7 +465,7 @@ def kopiera_vecka(personal_id, fran_vecka_start, till_vecka_start):
 def hamta_dagsbelastning(personal_id, datum):
     conn = get_connection()
     row = conn.execute(
-        "SELECT COALESCE(SUM(timmar), 0) as total FROM allokering WHERE personal_id=? AND datum=?",
+        _q("SELECT COALESCE(SUM(timmar), 0) as total FROM allokering WHERE personal_id=? AND datum=?"),
         (personal_id, str(datum))
     ).fetchone()
     conn.close()
@@ -306,7 +479,7 @@ def hamta_dagsbelastning(personal_id, datum):
 def hamta_kompetenser(personal_id):
     conn = get_connection()
     rows = conn.execute(
-        "SELECT tagg FROM kompetenser WHERE personal_id=? ORDER BY tagg",
+        _q("SELECT tagg FROM kompetenser WHERE personal_id=? ORDER BY tagg"),
         (personal_id,)
     ).fetchall()
     conn.close()
@@ -322,17 +495,18 @@ def hamta_alla_kompetenser():
 
 def satt_kompetenser(personal_id, taggar):
     conn = get_connection()
-    conn.execute("DELETE FROM kompetenser WHERE personal_id=?", (personal_id,))
+    conn.execute(_q("DELETE FROM kompetenser WHERE personal_id=?"), (personal_id,))
     for tagg in taggar:
         tagg = tagg.strip()
         if tagg:
             try:
                 conn.execute(
-                    "INSERT INTO kompetenser (personal_id, tagg) VALUES (?, ?)",
+                    _q("INSERT INTO kompetenser (personal_id, tagg) VALUES (?, ?)"),
                     (personal_id, tagg)
                 )
-            except sqlite3.IntegrityError:
-                pass
+            except _IntegrityError:
+                if _USE_POSTGRES:
+                    conn.rollback()
     conn.commit()
     conn.close()
 
@@ -372,7 +546,7 @@ def hamta_franvaro(personal_id=None, fran_datum=None, till_datum=None):
         query += " AND f.datum <= ?"
         params.append(str(till_datum))
     query += " ORDER BY f.datum, p.namn"
-    rows = conn.execute(query, params).fetchall()
+    rows = conn.execute(_q(query), params).fetchall()
     conn.close()
     return [dict(r) for r in rows]
 
@@ -383,16 +557,16 @@ def satt_franvaro(personal_id, datum, typ, notering=""):
     datum_str = str(datum)
     if not typ:
         conn.execute(
-            "DELETE FROM franvaro WHERE personal_id=? AND datum=?",
+            _q("DELETE FROM franvaro WHERE personal_id=? AND datum=?"),
             (personal_id, datum_str)
         )
     else:
-        conn.execute("""
+        conn.execute(_q("""
             INSERT INTO franvaro (personal_id, datum, typ, notering)
             VALUES (?, ?, ?, ?)
             ON CONFLICT(personal_id, datum)
             DO UPDATE SET typ = excluded.typ, notering = excluded.notering
-        """, (personal_id, datum_str, typ, notering))
+        """), (personal_id, datum_str, typ, notering))
     conn.commit()
     conn.close()
 
@@ -401,12 +575,12 @@ def bulk_franvaro(personal_id, datum_lista, typ, notering=""):
     """Registrera frånvaro för flera datum."""
     conn = get_connection()
     for d in datum_lista:
-        conn.execute("""
+        conn.execute(_q("""
             INSERT INTO franvaro (personal_id, datum, typ, notering)
             VALUES (?, ?, ?, ?)
             ON CONFLICT(personal_id, datum)
             DO UPDATE SET typ = excluded.typ, notering = excluded.notering
-        """, (personal_id, str(d), typ, notering))
+        """), (personal_id, str(d), typ, notering))
     conn.commit()
     conn.close()
 
@@ -415,7 +589,7 @@ def ta_bort_franvaro(personal_id, fran_datum, till_datum):
     """Ta bort all frånvaro för en person i ett intervall."""
     conn = get_connection()
     conn.execute(
-        "DELETE FROM franvaro WHERE personal_id=? AND datum >= ? AND datum <= ?",
+        _q("DELETE FROM franvaro WHERE personal_id=? AND datum >= ? AND datum <= ?"),
         (personal_id, str(fran_datum), str(till_datum))
     )
     conn.commit()
@@ -426,7 +600,7 @@ def ar_franvarande(personal_id, datum):
     """Kolla om en person är frånvarande ett specifikt datum."""
     conn = get_connection()
     row = conn.execute(
-        "SELECT typ FROM franvaro WHERE personal_id=? AND datum=?",
+        _q("SELECT typ FROM franvaro WHERE personal_id=? AND datum=?"),
         (personal_id, str(datum))
     ).fetchone()
     conn.close()
@@ -440,7 +614,7 @@ def ar_franvarande(personal_id, datum):
 def hamta_kommentar(personal_id, datum):
     conn = get_connection()
     row = conn.execute(
-        "SELECT text FROM kommentarer WHERE personal_id=? AND datum=?",
+        _q("SELECT text FROM kommentarer WHERE personal_id=? AND datum=?"),
         (personal_id, str(datum))
     ).fetchone()
     conn.close()
@@ -452,16 +626,16 @@ def satt_kommentar(personal_id, datum, text):
     conn = get_connection()
     if not text.strip():
         conn.execute(
-            "DELETE FROM kommentarer WHERE personal_id=? AND datum=?",
+            _q("DELETE FROM kommentarer WHERE personal_id=? AND datum=?"),
             (personal_id, str(datum))
         )
     else:
-        conn.execute("""
+        conn.execute(_q(f"""
             INSERT INTO kommentarer (personal_id, datum, text)
             VALUES (?, ?, ?)
             ON CONFLICT(personal_id, datum)
-            DO UPDATE SET text = excluded.text, skapad = datetime('now')
-        """, (personal_id, str(datum), text.strip()))
+            DO UPDATE SET text = excluded.text, skapad = {_NOW_FUNC}
+        """), (personal_id, str(datum), text.strip()))
     conn.commit()
     conn.close()
 
@@ -469,7 +643,7 @@ def satt_kommentar(personal_id, datum, text):
 def hamta_kommentarer_period(personal_id, fran_datum, till_datum):
     conn = get_connection()
     rows = conn.execute(
-        "SELECT datum, text FROM kommentarer WHERE personal_id=? AND datum >= ? AND datum <= ? ORDER BY datum",
+        _q("SELECT datum, text FROM kommentarer WHERE personal_id=? AND datum >= ? AND datum <= ? ORDER BY datum"),
         (personal_id, str(fran_datum), str(till_datum))
     ).fetchall()
     conn.close()
@@ -483,16 +657,16 @@ def hamta_kommentarer_period(personal_id, fran_datum, till_datum):
 def hamta_overbelagda(fran_datum, till_datum):
     """Hitta alla person+datum som är överbelagda."""
     conn = get_connection()
-    rows = conn.execute("""
+    rows = conn.execute(_q("""
         SELECT a.personal_id, p.namn as personal_namn, a.datum,
                SUM(a.timmar) as total_timmar, p.kapacitet_h
         FROM allokering a
         JOIN personal p ON a.personal_id = p.id
         WHERE a.datum >= ? AND a.datum <= ? AND p.aktiv = 1
-        GROUP BY a.personal_id, a.datum
-        HAVING total_timmar > p.kapacitet_h
+        GROUP BY a.personal_id, a.datum, p.namn, p.kapacitet_h
+        HAVING SUM(a.timmar) > p.kapacitet_h
         ORDER BY a.datum, p.namn
-    """, (str(fran_datum), str(till_datum))).fetchall()
+    """), (str(fran_datum), str(till_datum))).fetchall()
     conn.close()
     return [dict(r) for r in rows]
 
@@ -507,14 +681,14 @@ def hamta_oallokerade(fran_datum, till_datum, arbetsdagar):
         for p in personal:
             # Kolla om personen har frånvaro
             franvaro = conn.execute(
-                "SELECT typ FROM franvaro WHERE personal_id=? AND datum=?",
+                _q("SELECT typ FROM franvaro WHERE personal_id=? AND datum=?"),
                 (p["id"], dag_str)
             ).fetchone()
             if franvaro:
                 continue  # Frånvarande, hoppa över
 
             allok = conn.execute(
-                "SELECT COALESCE(SUM(timmar), 0) as total FROM allokering WHERE personal_id=? AND datum=?",
+                _q("SELECT COALESCE(SUM(timmar), 0) as total FROM allokering WHERE personal_id=? AND datum=?"),
                 (p["id"], dag_str)
             ).fetchone()
             if allok["total"] == 0:
@@ -536,14 +710,14 @@ def hamta_lediga_resurser(datum):
     for p in personal:
         # Kolla frånvaro
         franvaro = conn.execute(
-            "SELECT typ FROM franvaro WHERE personal_id=? AND datum=?",
+            _q("SELECT typ FROM franvaro WHERE personal_id=? AND datum=?"),
             (p["id"], str(datum))
         ).fetchone()
         if franvaro:
             continue
 
         allok = conn.execute(
-            "SELECT COALESCE(SUM(timmar), 0) as total FROM allokering WHERE personal_id=? AND datum=?",
+            _q("SELECT COALESCE(SUM(timmar), 0) as total FROM allokering WHERE personal_id=? AND datum=?"),
             (p["id"], str(datum))
         ).fetchone()
         ledig_tid = p["kapacitet_h"] - allok["total"]

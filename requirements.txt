@@ -3,3 +3,4 @@ pandas>=2.0.0
 plotly>=5.15.0
 holidays>=0.34
 fpdf2>=2.7.0
+psycopg2-binary>=2.9.0

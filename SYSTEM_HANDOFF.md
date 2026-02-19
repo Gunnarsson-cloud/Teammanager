@@ -1,5 +1,5 @@
 # System State & Handoff Document
-## Teammanager - Resursplaneringsapplikation v3.0
+## Teammanager - Resursplaneringsapplikation v3.1
 
 > **Syfte:** Detta dokument innehåller ALLT en framtida utvecklare eller LLM behöver
 > för att underhålla, felsöka och vidareutveckla applikationen utan att gissa.
@@ -12,10 +12,10 @@
 | Egenskap | Värde |
 |----------|-------|
 | **Namn** | Teammanager |
-| **Version** | 3.0 |
+| **Version** | 3.1 |
 | **Språk** | Python 3.10+ |
 | **Ramverk** | Streamlit (wide layout, single-page app med sidebar-navigation) |
-| **Databas** | SQLite (fil: `teammanager.db`, skapas automatiskt vid start) |
+| **Databas** | **PostgreSQL via Supabase** (produktion) / SQLite (lokal fallback) |
 | **Hosting** | Streamlit Community Cloud (auto-deploy vid push) |
 | **Live URL** | `teammanager-stfn9tuicvkch4mulxcdpa.streamlit.app` |
 | **Repo** | `github.com/Gunnarsson-cloud/Teammanager` |
@@ -791,6 +791,7 @@ def kopiera_vecka(personal_id, fran_mandag, till_mandag):
 | plotly | >=5.15.0 | Interaktiva diagram (heatmap, bar, pie, gantt) | charts.py |
 | holidays | >=0.34 | Svenska helgdagar (röda dagar) | calendar_utils.py |
 | fpdf2 | >=2.7.0 | PDF-generering | export_utils.py |
+| psycopg2-binary | >=2.9.0 | PostgreSQL-driver (Supabase) | database.py |
 
 ### 8.2 Python standardbibliotek
 
@@ -840,13 +841,59 @@ git config user.name   # Andreas Gunnarsson
 git config user.email  # a.e.gunnarsson@gmail.com
 ```
 
-### 9.4 Viktigt att veta
+### 9.4 Supabase (PostgreSQL) — Persistent databas (NY i v3.1)
+
+Appen stödjer **dual-mode**: PostgreSQL (Supabase) i produktion, SQLite lokalt.
+
+**Hur det fungerar:**
+1. Vid appstart läser `database.py` `st.secrets["database"]["SUPABASE_DB_URL"]`
+2. Om URL finns OCH psycopg2 är installerat → PostgreSQL-läge (`_USE_POSTGRES = True`)
+3. Om URL saknas → SQLite-fallback (`teammanager.db` i projektmappen)
+
+**Konfiguration i Streamlit Cloud:**
+1. Gå till app settings → Secrets
+2. Lägg till:
+```toml
+[database]
+SUPABASE_DB_URL = "postgresql://postgres.[ref]:[lösenord]@aws-0-[region].pooler.supabase.com:6543/postgres"
+```
+
+**Konfiguration lokalt:**
+- Redigera `.streamlit/secrets.toml` (gitignored)
+- Eller sätt miljövariabel: `SUPABASE_DB_URL=postgresql://...`
+- Eller lämna tomt för SQLite-fallback
+
+**Tekniska detaljer (dual-mode i database.py):**
+
+| Komponent | SQLite | PostgreSQL |
+|-----------|--------|------------|
+| Anslutning | `sqlite3.connect(DB_PATH)` | `psycopg2.connect(URL)` via `_PgConnectionWrapper` |
+| Row factory | `sqlite3.Row` | `psycopg2.extras.DictCursor` |
+| Placeholders | `?` | `%s` (via `_q()` helper) |
+| AUTOINCREMENT | `INTEGER PRIMARY KEY AUTOINCREMENT` | `SERIAL PRIMARY KEY` |
+| Tidsstämpel | `datetime('now')` | `CURRENT_TIMESTAMP` (via `_NOW_FUNC`) |
+| Foreign keys | `PRAGMA foreign_keys = ON` | Aktiverade by default |
+| IntegrityError | `sqlite3.IntegrityError` | `psycopg2.IntegrityError` (via `_IntegrityError`) |
+| RETURNING id | `cursor.lastrowid` | `INSERT ... RETURNING id` |
+
+**Hjälpfunktioner (interna, ej exporterade):**
+
+| Funktion/klass | Syfte |
+|----------------|-------|
+| `_q(query)` | Ersätter `?` med `%s` om PostgreSQL-läge |
+| `_PgConnectionWrapper` | Wrappar psycopg2 att bete sig som sqlite3.Connection |
+| `_USE_POSTGRES` | `bool` — True om Supabase är konfigurerat |
+| `_IntegrityError` | Rätt exception-typ för aktuellt DB-läge |
+| `_NOW_FUNC` | `"datetime('now')"` eller `"CURRENT_TIMESTAMP"` |
+
+### 9.5 Viktigt att veta
 
 | Punkt | Detalj |
 |-------|--------|
 | DB auto-skapas | `init_db()` körs vid varje appstart, skapar tabeller om de inte finns |
-| Ephemeral disk | Streamlit Cloud raderar `teammanager.db` vid omstart/redeploy |
-| .gitignore | `.db`-filer, `__pycache__/`, `.env`, `venv/` exkluderas |
+| Data persistent | Med Supabase överlever data redeploys och omstarter |
+| SQLite fallback | Utan `SUPABASE_DB_URL` faller appen tillbaka till lokal SQLite |
+| .gitignore | `.db`-filer, `__pycache__/`, `.env`, `venv/`, `.streamlit/secrets.toml` exkluderas |
 | git add | Använd ALDRIG `git add -A` på Windows (fångar `nul` device-fil). Använd `git add filnamn1 filnamn2` |
 | Python ej installerat lokalt | Maskinen har ej Python. Appen körs enbart på Streamlit Cloud |
 | Plotly transparent | Alla diagram: `paper_bgcolor='rgba(0,0,0,0)'`, `plot_bgcolor='rgba(0,0,0,0)'` |
@@ -946,13 +993,25 @@ from calendar_utils import hamta_arbetsdagar
 - [x] **Gantt-diagram** - Plotly horisontella staplat stapeldiagram per person
 - [x] **Frånvarodiagram** - Plotly stacked bar per typ och person
 
+### v3.1 (2026-02-19) - Persistent databas (Supabase)
+- [x] **Dual-mode databas** - PostgreSQL (Supabase) i produktion, SQLite lokalt
+- [x] **`_PgConnectionWrapper`** - Wrappar psycopg2 att bete sig som sqlite3.Connection
+- [x] **`_q()` placeholder-helper** - Konverterar `?` → `%s` för PostgreSQL
+- [x] **Dubbla CREATE TABLE** - `SERIAL PRIMARY KEY` (PG) / `AUTOINCREMENT` (SQLite)
+- [x] **RETURNING id** - PostgreSQL-kompatibel ID-retur vid INSERT
+- [x] **HAVING-fix** - `SUM(a.timmar)` istället för kolumnalias (PG-kompatibelt)
+- [x] **GROUP BY-fix** - Alla icke-aggregerade kolumner i GROUP BY (PG strict mode)
+- [x] **Secrets-konfiguration** - Via `st.secrets` (Streamlit Cloud) eller miljövariabel
+- [x] **psycopg2-binary** tillagd i requirements.txt
+- [x] **Data överlever redeploys** - Löser begränsning #1 från v3.0
+
 ---
 
 ## 12. Kända begränsningar
 
 | # | Begränsning | Orsak | Föreslagen lösning |
 |---|------------|-------|-------------------|
-| 1 | Data försvinner vid redeploy | Streamlit Cloud ephemeral disk | Migrera till PostgreSQL/Supabase |
+| 1 | ~~Data försvinner vid redeploy~~ | ~~Streamlit Cloud ephemeral disk~~ | **LÖST i v3.1 med Supabase** |
 | 2 | Ingen autentisering | Ej implementerat | Lägg till `streamlit-authenticator` |
 | 3 | Långsam heatmap vid stor data | O(n*m) Python-loop per person per vecka per dag | Precompute med SQL-aggregering |
 | 4 | PDF utan å/ä/ö | fpdf2 Helvetica har ej stöd | Byt till Unicode-font (DejaVu) |
@@ -967,7 +1026,7 @@ from calendar_utils import hamta_arbetsdagar
 
 ## 13. Naturliga nästa steg (ej implementerat)
 
-- [ ] Persistent databas (PostgreSQL/Supabase) för Streamlit Cloud
+- [x] ~~Persistent databas (PostgreSQL/Supabase) för Streamlit Cloud~~ **LÖST i v3.1**
 - [ ] Användarautentisering (multi-user, lösenord)
 - [ ] Drag-and-drop allokering i kalendervy
 - [ ] API-integration mot projektverktyg (Jira, Azure DevOps)
@@ -982,6 +1041,7 @@ from calendar_utils import hamta_arbetsdagar
 
 ---
 
-*Dokumentet uppdaterat: 2026-02-19 | Version: 3.0*
-*Total kodbas: ~2020 rader Python + ~230 rader CSS*
+*Dokumentet uppdaterat: 2026-02-19 | Version: 3.1*
+*Total kodbas: ~2100 rader Python + ~230 rader CSS*
 *Antal databastabeller: 6 | Antal sidor: 9 | Antal Plotly-diagram: 6*
+*Databas: Supabase PostgreSQL (produktion) / SQLite (lokal fallback)*
